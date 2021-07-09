@@ -1,4 +1,15 @@
-// Copyright 2012-2017 Apcera Inc. All rights reserved.
+// Copyright 2012-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package test
 
@@ -9,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/gnatsd/server"
+	"github.com/nats-io/nats-server/v2/server"
 )
 
 func doAuthConnect(t tLogger, c net.Conn, token, user, pass string) {
@@ -51,7 +62,7 @@ func runAuthServerWithToken() *server.Server {
 func TestNoAuthClient(t *testing.T) {
 	s := runAuthServerWithToken()
 	defer s.Shutdown()
-	c := createClientConn(t, "localhost", AUTH_PORT)
+	c := createClientConn(t, "127.0.0.1", AUTH_PORT)
 	defer c.Close()
 	expectAuthRequired(t, c)
 	doAuthConnect(t, c, "", "", "")
@@ -61,7 +72,7 @@ func TestNoAuthClient(t *testing.T) {
 func TestAuthClientBadToken(t *testing.T) {
 	s := runAuthServerWithToken()
 	defer s.Shutdown()
-	c := createClientConn(t, "localhost", AUTH_PORT)
+	c := createClientConn(t, "127.0.0.1", AUTH_PORT)
 	defer c.Close()
 	expectAuthRequired(t, c)
 	doAuthConnect(t, c, "ZZZ", "", "")
@@ -71,7 +82,7 @@ func TestAuthClientBadToken(t *testing.T) {
 func TestAuthClientNoConnect(t *testing.T) {
 	s := runAuthServerWithToken()
 	defer s.Shutdown()
-	c := createClientConn(t, "localhost", AUTH_PORT)
+	c := createClientConn(t, "127.0.0.1", AUTH_PORT)
 	defer c.Close()
 	expectAuthRequired(t, c)
 	// This is timing dependent..
@@ -82,7 +93,7 @@ func TestAuthClientNoConnect(t *testing.T) {
 func TestAuthClientGoodConnect(t *testing.T) {
 	s := runAuthServerWithToken()
 	defer s.Shutdown()
-	c := createClientConn(t, "localhost", AUTH_PORT)
+	c := createClientConn(t, "127.0.0.1", AUTH_PORT)
 	defer c.Close()
 	expectAuthRequired(t, c)
 	doAuthConnect(t, c, AUTH_TOKEN, "", "")
@@ -92,7 +103,7 @@ func TestAuthClientGoodConnect(t *testing.T) {
 func TestAuthClientFailOnEverythingElse(t *testing.T) {
 	s := runAuthServerWithToken()
 	defer s.Shutdown()
-	c := createClientConn(t, "localhost", AUTH_PORT)
+	c := createClientConn(t, "127.0.0.1", AUTH_PORT)
 	defer c.Close()
 	expectAuthRequired(t, c)
 	sendProto(t, c, "PUB foo 2\r\nok\r\n")
@@ -117,7 +128,7 @@ func runAuthServerWithUserPass() *server.Server {
 func TestNoUserOrPasswordClient(t *testing.T) {
 	s := runAuthServerWithUserPass()
 	defer s.Shutdown()
-	c := createClientConn(t, "localhost", AUTH_PORT)
+	c := createClientConn(t, "127.0.0.1", AUTH_PORT)
 	defer c.Close()
 	expectAuthRequired(t, c)
 	doAuthConnect(t, c, "", "", "")
@@ -127,7 +138,7 @@ func TestNoUserOrPasswordClient(t *testing.T) {
 func TestBadUserClient(t *testing.T) {
 	s := runAuthServerWithUserPass()
 	defer s.Shutdown()
-	c := createClientConn(t, "localhost", AUTH_PORT)
+	c := createClientConn(t, "127.0.0.1", AUTH_PORT)
 	defer c.Close()
 	expectAuthRequired(t, c)
 	doAuthConnect(t, c, "", "derekzz", AUTH_PASS)
@@ -137,7 +148,7 @@ func TestBadUserClient(t *testing.T) {
 func TestBadPasswordClient(t *testing.T) {
 	s := runAuthServerWithUserPass()
 	defer s.Shutdown()
-	c := createClientConn(t, "localhost", AUTH_PORT)
+	c := createClientConn(t, "127.0.0.1", AUTH_PORT)
 	defer c.Close()
 	expectAuthRequired(t, c)
 	doAuthConnect(t, c, "", AUTH_USER, "ZZ")
@@ -147,7 +158,7 @@ func TestBadPasswordClient(t *testing.T) {
 func TestPasswordClientGoodConnect(t *testing.T) {
 	s := runAuthServerWithUserPass()
 	defer s.Shutdown()
-	c := createClientConn(t, "localhost", AUTH_PORT)
+	c := createClientConn(t, "127.0.0.1", AUTH_PORT)
 	defer c.Close()
 	expectAuthRequired(t, c)
 	doAuthConnect(t, c, "", AUTH_USER, AUTH_PASS)
@@ -158,7 +169,7 @@ func TestPasswordClientGoodConnect(t *testing.T) {
 // The bcrypt username/password version
 ////////////////////////////////////////////////////////////
 
-// Generated with util/mkpasswd (Cost 4 because of cost of --race, default is 11)
+// Generated with nats server passwd (Cost 4 because of cost of --race, default is 11)
 const BCRYPT_AUTH_PASS = "IW@$6v(y1(t@fhPDvf!5^%"
 const BCRYPT_AUTH_HASH = "$2a$04$Q.CgCP2Sl9pkcTXEZHazaeMwPaAkSHk7AI51HkyMt5iJQQyUA4qxq"
 
@@ -173,7 +184,7 @@ func runAuthServerWithBcryptUserPass() *server.Server {
 func TestBadBcryptPassword(t *testing.T) {
 	s := runAuthServerWithBcryptUserPass()
 	defer s.Shutdown()
-	c := createClientConn(t, "localhost", AUTH_PORT)
+	c := createClientConn(t, "127.0.0.1", AUTH_PORT)
 	defer c.Close()
 	expectAuthRequired(t, c)
 	doAuthConnect(t, c, "", AUTH_USER, BCRYPT_AUTH_HASH)
@@ -183,7 +194,7 @@ func TestBadBcryptPassword(t *testing.T) {
 func TestGoodBcryptPassword(t *testing.T) {
 	s := runAuthServerWithBcryptUserPass()
 	defer s.Shutdown()
-	c := createClientConn(t, "localhost", AUTH_PORT)
+	c := createClientConn(t, "127.0.0.1", AUTH_PORT)
 	defer c.Close()
 	expectAuthRequired(t, c)
 	doAuthConnect(t, c, "", AUTH_USER, BCRYPT_AUTH_PASS)
@@ -207,7 +218,7 @@ func runAuthServerWithBcryptToken() *server.Server {
 func TestBadBcryptToken(t *testing.T) {
 	s := runAuthServerWithBcryptToken()
 	defer s.Shutdown()
-	c := createClientConn(t, "localhost", AUTH_PORT)
+	c := createClientConn(t, "127.0.0.1", AUTH_PORT)
 	defer c.Close()
 	expectAuthRequired(t, c)
 	doAuthConnect(t, c, BCRYPT_AUTH_TOKEN_HASH, "", "")
@@ -217,7 +228,7 @@ func TestBadBcryptToken(t *testing.T) {
 func TestGoodBcryptToken(t *testing.T) {
 	s := runAuthServerWithBcryptToken()
 	defer s.Shutdown()
-	c := createClientConn(t, "localhost", AUTH_PORT)
+	c := createClientConn(t, "127.0.0.1", AUTH_PORT)
 	defer c.Close()
 	expectAuthRequired(t, c)
 	doAuthConnect(t, c, BCRYPT_AUTH_TOKEN, "", "")

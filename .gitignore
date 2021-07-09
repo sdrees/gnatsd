@@ -7,6 +7,10 @@
 _obj
 _test
 
+# Configuration Files
+*.conf
+*.cfg
+
 # Architecture specific extensions/prefixes
 *.[568vq]
 [568vq].out
@@ -36,11 +40,12 @@ _testmain.go
 .DS_Store
 
 # bin
+nats-server
 gnatsd
+check
 
 # coverage
 coverage.out
 
 # Cross compiled binaries
 pkg
-

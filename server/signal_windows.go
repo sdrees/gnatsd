@@ -1,4 +1,15 @@
-// Copyright 2012-2016 Apcera Inc. All rights reserved.
+// Copyright 2012-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package server
 
@@ -24,14 +35,14 @@ func (s *Server) handleSignals() {
 	go func() {
 		for sig := range c {
 			s.Debugf("Trapped %q signal", sig)
-			s.Noticef("Server Exiting..")
+			s.Shutdown()
 			os.Exit(0)
 		}
 	}()
 }
 
-// ProcessSignal sends the given signal command to the running gnatsd service.
-// If service is empty, this signals the "gnatsd" service. This returns an
+// ProcessSignal sends the given signal command to the running nats-server service.
+// If service is empty, this signals the "nats-server" service. This returns an
 // error is the given service is not running or the command is invalid.
 func ProcessSignal(command Command, service string) error {
 	if service == "" {
@@ -64,6 +75,9 @@ func ProcessSignal(command Command, service string) error {
 		to = svc.Running
 	case CommandReload:
 		cmd = svc.ParamChange
+		to = svc.Running
+	case commandLDMode:
+		cmd = ldmCmd
 		to = svc.Running
 	default:
 		return fmt.Errorf("unknown signal %q", command)

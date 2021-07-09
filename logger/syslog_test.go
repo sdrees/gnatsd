@@ -1,3 +1,16 @@
+// Copyright 2012-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // +build !windows
 
 package logger
@@ -54,14 +67,14 @@ func TestSysLoggerTagGen(t *testing.T) {
 	origArg := os.Args[0]
 	defer restoreArg(origArg)
 
-	testTag(t, "gnatsd", "gnatsd")
-	testTag(t, filepath.Join(".", "gnatsd"), "gnatsd")
-	testTag(t, filepath.Join("home", "bin", "gnatsd"), "gnatsd")
-	testTag(t, filepath.Join("..", "..", "gnatsd"), "gnatsd")
-	testTag(t, "gnatsd.service1", "gnatsd.service1")
-	testTag(t, "gnatsd_service1", "gnatsd_service1")
-	testTag(t, "gnatsd-service1", "gnatsd-service1")
-	testTag(t, "gnatsd service1", "gnatsd service1")
+	testTag(t, "nats-server", "nats-server")
+	testTag(t, filepath.Join(".", "nats-server"), "nats-server")
+	testTag(t, filepath.Join("home", "bin", "nats-server"), "nats-server")
+	testTag(t, filepath.Join("..", "..", "nats-server"), "nats-server")
+	testTag(t, "nats-server.service1", "nats-server.service1")
+	testTag(t, "nats-server_service1", "nats-server_service1")
+	testTag(t, "nats-server-service1", "nats-server-service1")
+	testTag(t, "nats-server service1", "nats-server service1")
 }
 
 func TestSysLoggerTag(t *testing.T) {
@@ -98,6 +111,8 @@ func TestRemoteSysLogger(t *testing.T) {
 	if !logger.trace {
 		t.Fatalf("Expected %t, received %t\n", true, logger.trace)
 	}
+	logger.Noticef("foo")
+	<-done
 }
 
 func TestRemoteSysLoggerNotice(t *testing.T) {

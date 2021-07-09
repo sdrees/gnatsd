@@ -1,26 +1,43 @@
-// Copyright 2012-2016 Apcera Inc. All rights reserved.
+// Copyright 2012-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package main
+
+//go:generate go run server/errors_gen.go
 
 import (
 	"flag"
 	"fmt"
 	"os"
 
-	"github.com/nats-io/gnatsd/server"
+	"github.com/nats-io/nats-server/v2/server"
 )
 
 var usageStr = `
-Usage: gnatsd [options]
+Usage: nats-server [options]
 
 Server Options:
     -a, --addr <host>                Bind to host address (default: 0.0.0.0)
     -p, --port <port>                Use port for clients (default: 4222)
+    -n, --name <server_name>         Server name (default: auto)
     -P, --pid <file>                 File to store PID
     -m, --http_port <port>           Use port for http monitoring
     -ms,--https_port <port>          Use port for https monitoring
     -c, --config <file>              Configuration file
-    -sl,--signal <signal>[=<pid>]    Send signal to gnatsd process (stop, quit, reopen, reload)
+    -t                               Test configuration and exit
+    -sl,--signal <signal>[=<pid>]    Send signal to nats-server process (stop, quit, reopen, reload)
+                                     <pid> can be either a PID (e.g. 1) or the path to a PID file (e.g. /var/run/nats-server.pid)
+        --client_advertise <string>  Client URL to advertise to other servers
 
 Logging Options:
     -l, --log <file>                 File to redirect log output
@@ -29,7 +46,13 @@ Logging Options:
     -r, --remote_syslog <addr>       Syslog server addr (udp://localhost:514)
     -D, --debug                      Enable debugging output
     -V, --trace                      Trace the raw protocol
+    -VV                              Verbose trace (traces system account as well)
     -DV                              Debug and trace
+    -DVV                             Debug and verbose trace (traces system account as well)
+
+JetStream Options:
+    -js, --jetstream                 Enable JetStream functionality.
+    -sd, --store_dir <dir>           Set the storage directory.
 
 Authorization Options:
         --user <user>                User required for connections
@@ -46,9 +69,10 @@ TLS Options:
 Cluster Options:
         --routes <rurl-1, rurl-2>    Routes to solicit and connect
         --cluster <cluster-url>      Cluster URL for solicited routes
-        --no_advertise <bool>        Advertise known cluster IPs to clients
+        --cluster_name <string>      Cluster Name, if not set one will be dynamically generated
+        --no_advertise <bool>        Do not advertise known cluster information to clients
+        --cluster_advertise <string> Cluster URL to advertise to other servers
         --connect_retries <number>   For implicit routes, number of connect retries
-
 
 Common Options:
     -h, --help                       Show this message
@@ -63,8 +87,10 @@ func usage() {
 }
 
 func main() {
+	exe := "nats-server"
+
 	// Create a FlagSet and sets the usage
-	fs := flag.NewFlagSet("nats-server", flag.ExitOnError)
+	fs := flag.NewFlagSet(exe, flag.ExitOnError)
 	fs.Usage = usage
 
 	// Configure the options from the flags/config file
@@ -73,11 +99,17 @@ func main() {
 		fs.Usage,
 		server.PrintTLSHelpAndDie)
 	if err != nil {
-		server.PrintAndDie(err.Error() + "\n" + usageStr)
+		server.PrintAndDie(fmt.Sprintf("%s: %s", exe, err))
+	} else if opts.CheckConfig {
+		fmt.Fprintf(os.Stderr, "%s: configuration file %s is valid\n", exe, opts.ConfigFile)
+		os.Exit(0)
 	}
 
 	// Create the server with appropriate options.
-	s := server.New(opts)
+	s, err := server.NewServer(opts)
+	if err != nil {
+		server.PrintAndDie(fmt.Sprintf("%s: %s", exe, err))
+	}
 
 	// Configure the logger based on the flags
 	s.ConfigureLogger()
@@ -86,4 +118,5 @@ func main() {
 	if err := server.Run(s); err != nil {
 		server.PrintAndDie(err.Error())
 	}
+	s.WaitForShutdown()
 }

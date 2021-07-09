@@ -1,32 +1,59 @@
-// Copyright 2012-2014 Apcera Inc. All rights reserved.
+// Copyright 2012-2020 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package server
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
+	"net/http"
+	"net/textproto"
 )
 
-type pubArg struct {
-	subject []byte
-	reply   []byte
-	sid     []byte
-	szb     []byte
-	size    int
-}
-
+type parserState int
 type parseState struct {
-	state   int
+	state   parserState
+	op      byte
 	as      int
 	drop    int
 	pa      pubArg
 	argBuf  []byte
 	msgBuf  []byte
+	header  http.Header // access via getHeader
 	scratch [MAX_CONTROL_LINE_SIZE]byte
+}
+
+type pubArg struct {
+	arg     []byte
+	pacache []byte
+	origin  []byte
+	account []byte
+	subject []byte
+	deliver []byte
+	mapped  []byte
+	reply   []byte
+	szb     []byte
+	hdb     []byte
+	queues  [][]byte
+	size    int
+	hdr     int
+	psi     *serviceImport
 }
 
 // Parser constants
 const (
-	OP_START = iota
+	OP_START parserState = iota
 	OP_PLUS
 	OP_PLUS_O
 	OP_PLUS_OK
@@ -44,6 +71,17 @@ const (
 	OP_CONNEC
 	OP_CONNECT
 	CONNECT_ARG
+	OP_H
+	OP_HP
+	OP_HPU
+	OP_HPUB
+	OP_HPUB_SPC
+	HPUB_ARG
+	OP_HM
+	OP_HMS
+	OP_HMSG
+	OP_HMSG_SPC
+	HMSG_ARG
 	OP_P
 	OP_PU
 	OP_PUB
@@ -56,12 +94,24 @@ const (
 	OP_PON
 	OP_PONG
 	MSG_PAYLOAD
-	MSG_END
+	MSG_END_R
+	MSG_END_N
 	OP_S
 	OP_SU
 	OP_SUB
 	OP_SUB_SPC
 	SUB_ARG
+	OP_A
+	OP_ASUB
+	OP_ASUB_SPC
+	ASUB_ARG
+	OP_AUSUB
+	OP_AUSUB_SPC
+	AUSUB_ARG
+	OP_L
+	OP_LS
+	OP_R
+	OP_RS
 	OP_U
 	OP_UN
 	OP_UNS
@@ -82,17 +132,24 @@ const (
 )
 
 func (c *client) parse(buf []byte) error {
+	// Branch out to mqtt clients. c.mqtt is immutable, but should it become
+	// an issue (say data race detection), we could branch outside in readLoop
+	if c.isMqtt() {
+		return c.mqttParse(buf)
+	}
 	var i int
 	var b byte
+	var lmsg bool
 
-	mcl := MAX_CONTROL_LINE_SIZE
-	if c.srv != nil && c.srv.getOpts() != nil {
-		mcl = c.srv.getOpts().MaxControlLine
-	}
-
-	// snapshot this, and reset when we receive a
+	// Snapshots
+	c.mu.Lock()
+	// Snapshot and then reset when we receive a
 	// proper CONNECT if needed.
-	authSet := c.isAuthTimerSet()
+	authSet := c.awaitingAuth()
+	// Snapshot max control line as well.
+	mcl := c.mcl
+	trace := c.trace
+	c.mu.Unlock()
 
 	// Move to loop instead of range syntax to allow jumping of i
 	for i = 0; i < len(buf); i++ {
@@ -100,21 +157,45 @@ func (c *client) parse(buf []byte) error {
 
 		switch c.state {
 		case OP_START:
-			if b != 'C' && b != 'c' && authSet {
-				goto authErr
+			c.op = b
+			if b != 'C' && b != 'c' {
+				if authSet {
+					goto authErr
+				}
+				// If the connection is a gateway connection, make sure that
+				// if this is an inbound, it starts with a CONNECT.
+				if c.kind == GATEWAY && !c.gw.outbound && !c.gw.connected {
+					// Use auth violation since no CONNECT was sent.
+					// It could be a parseErr too.
+					goto authErr
+				}
 			}
 			switch b {
 			case 'P', 'p':
 				c.state = OP_P
+			case 'H', 'h':
+				c.state = OP_H
 			case 'S', 's':
 				c.state = OP_S
 			case 'U', 'u':
 				c.state = OP_U
-			case 'M', 'm':
-				if c.typ == CLIENT {
+			case 'R', 'r':
+				if c.kind == CLIENT {
 					goto parseErr
 				} else {
-					c.state = OP_M
+					c.state = OP_R
+				}
+			case 'L', 'l':
+				if c.kind != LEAF && c.kind != ROUTER {
+					goto parseErr
+				} else {
+					c.state = OP_L
+				}
+			case 'A', 'a':
+				if c.kind == CLIENT {
+					goto parseErr
+				} else {
+					c.state = OP_A
 				}
 			case 'C', 'c':
 				c.state = OP_C
@@ -126,6 +207,150 @@ func (c *client) parse(buf []byte) error {
 				c.state = OP_MINUS
 			default:
 				goto parseErr
+			}
+		case OP_H:
+			switch b {
+			case 'P', 'p':
+				c.state = OP_HP
+			case 'M', 'm':
+				c.state = OP_HM
+			default:
+				goto parseErr
+			}
+		case OP_HP:
+			switch b {
+			case 'U', 'u':
+				c.state = OP_HPU
+			default:
+				goto parseErr
+			}
+		case OP_HPU:
+			switch b {
+			case 'B', 'b':
+				c.state = OP_HPUB
+			default:
+				goto parseErr
+			}
+		case OP_HPUB:
+			switch b {
+			case ' ', '\t':
+				c.state = OP_HPUB_SPC
+			default:
+				goto parseErr
+			}
+		case OP_HPUB_SPC:
+			switch b {
+			case ' ', '\t':
+				continue
+			default:
+				c.pa.hdr = 0
+				c.state = HPUB_ARG
+				c.as = i
+			}
+		case HPUB_ARG:
+			switch b {
+			case '\r':
+				c.drop = 1
+			case '\n':
+				var arg []byte
+				if c.argBuf != nil {
+					arg = c.argBuf
+					c.argBuf = nil
+				} else {
+					arg = buf[c.as : i-c.drop]
+				}
+				if err := c.overMaxControlLineLimit(arg, mcl); err != nil {
+					return err
+				}
+				if trace {
+					c.traceInOp("HPUB", arg)
+				}
+				if err := c.processHeaderPub(arg); err != nil {
+					return err
+				}
+
+				c.drop, c.as, c.state = 0, i+1, MSG_PAYLOAD
+				// If we don't have a saved buffer then jump ahead with
+				// the index. If this overruns what is left we fall out
+				// and process split buffer.
+				if c.msgBuf == nil {
+					i = c.as + c.pa.size - LEN_CR_LF
+				}
+			default:
+				if c.argBuf != nil {
+					c.argBuf = append(c.argBuf, b)
+				}
+			}
+		case OP_HM:
+			switch b {
+			case 'S', 's':
+				c.state = OP_HMS
+			default:
+				goto parseErr
+			}
+		case OP_HMS:
+			switch b {
+			case 'G', 'g':
+				c.state = OP_HMSG
+			default:
+				goto parseErr
+			}
+		case OP_HMSG:
+			switch b {
+			case ' ', '\t':
+				c.state = OP_HMSG_SPC
+			default:
+				goto parseErr
+			}
+		case OP_HMSG_SPC:
+			switch b {
+			case ' ', '\t':
+				continue
+			default:
+				c.pa.hdr = 0
+				c.state = HMSG_ARG
+				c.as = i
+			}
+		case HMSG_ARG:
+			switch b {
+			case '\r':
+				c.drop = 1
+			case '\n':
+				var arg []byte
+				if c.argBuf != nil {
+					arg = c.argBuf
+					c.argBuf = nil
+				} else {
+					arg = buf[c.as : i-c.drop]
+				}
+				if err := c.overMaxControlLineLimit(arg, mcl); err != nil {
+					return err
+				}
+				var err error
+				if c.kind == ROUTER || c.kind == GATEWAY {
+					if trace {
+						c.traceInOp("HMSG", arg)
+					}
+					err = c.processRoutedHeaderMsgArgs(arg)
+				} else if c.kind == LEAF {
+					if trace {
+						c.traceInOp("HMSG", arg)
+					}
+					err = c.processLeafHeaderMsgArgs(arg)
+				}
+				if err != nil {
+					return err
+				}
+				c.drop, c.as, c.state = 0, i+1, MSG_PAYLOAD
+
+				// jump ahead with the index. If this overruns
+				// what is left we fall out and process split
+				// buffer.
+				i = c.as + c.pa.size - LEN_CR_LF
+			default:
+				if c.argBuf != nil {
+					c.argBuf = append(c.argBuf, b)
+				}
 			}
 		case OP_P:
 			switch b {
@@ -157,6 +382,7 @@ func (c *client) parse(buf []byte) error {
 			case ' ', '\t':
 				continue
 			default:
+				c.pa.hdr = -1
 				c.state = PUB_ARG
 				c.as = i
 			}
@@ -168,13 +394,21 @@ func (c *client) parse(buf []byte) error {
 				var arg []byte
 				if c.argBuf != nil {
 					arg = c.argBuf
+					c.argBuf = nil
 				} else {
 					arg = buf[c.as : i-c.drop]
+				}
+				if err := c.overMaxControlLineLimit(arg, mcl); err != nil {
+					return err
+				}
+				if trace {
+					c.traceInOp("PUB", arg)
 				}
 				if err := c.processPub(arg); err != nil {
 					return err
 				}
-				c.drop, c.as, c.state = OP_START, i+1, MSG_PAYLOAD
+
+				c.drop, c.as, c.state = 0, i+1, MSG_PAYLOAD
 				// If we don't have a saved buffer then jump ahead with
 				// the index. If this overruns what is left we fall out
 				// and process split buffer.
@@ -206,31 +440,137 @@ func (c *client) parse(buf []byte) error {
 					c.msgBuf = append(c.msgBuf, b)
 				}
 				if len(c.msgBuf) >= c.pa.size {
-					c.state = MSG_END
+					c.state = MSG_END_R
 				}
-			} else if i-c.as >= c.pa.size {
-				c.state = MSG_END
+			} else if i-c.as+1 >= c.pa.size {
+				c.state = MSG_END_R
 			}
-		case MSG_END:
+		case MSG_END_R:
+			if b != '\r' {
+				goto parseErr
+			}
+			if c.msgBuf != nil {
+				c.msgBuf = append(c.msgBuf, b)
+			}
+			c.state = MSG_END_N
+		case MSG_END_N:
+			if b != '\n' {
+				goto parseErr
+			}
+			if c.msgBuf != nil {
+				c.msgBuf = append(c.msgBuf, b)
+			} else {
+				c.msgBuf = buf[c.as : i+1]
+			}
+
+			// Check for mappings.
+			if (c.kind == CLIENT || c.kind == LEAF) && c.in.flags.isSet(hasMappings) {
+				changed := c.selectMappedSubject()
+				if trace && changed {
+					c.traceInOp("MAPPING", []byte(fmt.Sprintf("%s -> %s", c.pa.mapped, c.pa.subject)))
+				}
+			}
+			if trace {
+				c.traceMsg(c.msgBuf)
+			}
+
+			c.processInboundMsg(c.msgBuf)
+			c.argBuf, c.msgBuf, c.header = nil, nil, nil
+			c.drop, c.as, c.state = 0, i+1, OP_START
+			// Drop all pub args
+			c.pa.arg, c.pa.pacache, c.pa.origin, c.pa.account, c.pa.subject, c.pa.mapped = nil, nil, nil, nil, nil, nil
+			c.pa.reply, c.pa.hdr, c.pa.size, c.pa.szb, c.pa.hdb, c.pa.queues = nil, -1, 0, nil, nil, nil
+			lmsg = false
+		case OP_A:
 			switch b {
+			case '+':
+				c.state = OP_ASUB
+			case '-', 'u':
+				c.state = OP_AUSUB
+			default:
+				goto parseErr
+			}
+		case OP_ASUB:
+			switch b {
+			case ' ', '\t':
+				c.state = OP_ASUB_SPC
+			default:
+				goto parseErr
+			}
+		case OP_ASUB_SPC:
+			switch b {
+			case ' ', '\t':
+				continue
+			default:
+				c.state = ASUB_ARG
+				c.as = i
+			}
+		case ASUB_ARG:
+			switch b {
+			case '\r':
+				c.drop = 1
 			case '\n':
-				if c.msgBuf != nil {
-					c.msgBuf = append(c.msgBuf, b)
+				var arg []byte
+				if c.argBuf != nil {
+					arg = c.argBuf
+					c.argBuf = nil
 				} else {
-					c.msgBuf = buf[c.as : i+1]
+					arg = buf[c.as : i-c.drop]
 				}
-				// strict check for proto
-				if len(c.msgBuf) != c.pa.size+LEN_CR_LF {
-					goto parseErr
+				if err := c.overMaxControlLineLimit(arg, mcl); err != nil {
+					return err
 				}
-				c.processMsg(c.msgBuf)
-				c.argBuf, c.msgBuf = nil, nil
+				if trace {
+					c.traceInOp("A+", arg)
+				}
+				if err := c.processAccountSub(arg); err != nil {
+					return err
+				}
 				c.drop, c.as, c.state = 0, i+1, OP_START
 			default:
-				if c.msgBuf != nil {
-					c.msgBuf = append(c.msgBuf, b)
+				if c.argBuf != nil {
+					c.argBuf = append(c.argBuf, b)
 				}
+			}
+		case OP_AUSUB:
+			switch b {
+			case ' ', '\t':
+				c.state = OP_AUSUB_SPC
+			default:
+				goto parseErr
+			}
+		case OP_AUSUB_SPC:
+			switch b {
+			case ' ', '\t':
 				continue
+			default:
+				c.state = AUSUB_ARG
+				c.as = i
+			}
+		case AUSUB_ARG:
+			switch b {
+			case '\r':
+				c.drop = 1
+			case '\n':
+				var arg []byte
+				if c.argBuf != nil {
+					arg = c.argBuf
+					c.argBuf = nil
+				} else {
+					arg = buf[c.as : i-c.drop]
+				}
+				if err := c.overMaxControlLineLimit(arg, mcl); err != nil {
+					return err
+				}
+				if trace {
+					c.traceInOp("A-", arg)
+				}
+				c.processAccountUnsub(arg)
+				c.drop, c.as, c.state = 0, i+1, OP_START
+			default:
+				if c.argBuf != nil {
+					c.argBuf = append(c.argBuf, b)
+				}
 			}
 		case OP_S:
 			switch b {
@@ -273,7 +613,42 @@ func (c *client) parse(buf []byte) error {
 				} else {
 					arg = buf[c.as : i-c.drop]
 				}
-				if err := c.processSub(arg); err != nil {
+				if err := c.overMaxControlLineLimit(arg, mcl); err != nil {
+					return err
+				}
+				var err error
+
+				switch c.kind {
+				case CLIENT:
+					if trace {
+						c.traceInOp("SUB", arg)
+					}
+					err = c.parseSub(arg, false)
+				case ROUTER:
+					switch c.op {
+					case 'R', 'r':
+						if trace {
+							c.traceInOp("RS+", arg)
+						}
+						err = c.processRemoteSub(arg, false)
+					case 'L', 'l':
+						if trace {
+							c.traceInOp("LS+", arg)
+						}
+						err = c.processRemoteSub(arg, true)
+					}
+				case GATEWAY:
+					if trace {
+						c.traceInOp("RS+", arg)
+					}
+					err = c.processGatewayRSub(arg)
+				case LEAF:
+					if trace {
+						c.traceInOp("LS+", arg)
+					}
+					err = c.processLeafSub(arg)
+				}
+				if err != nil {
 					return err
 				}
 				c.drop, c.as, c.state = 0, i+1, OP_START
@@ -281,6 +656,42 @@ func (c *client) parse(buf []byte) error {
 				if c.argBuf != nil {
 					c.argBuf = append(c.argBuf, b)
 				}
+			}
+		case OP_L:
+			switch b {
+			case 'S', 's':
+				c.state = OP_LS
+			case 'M', 'm':
+				c.state = OP_M
+			default:
+				goto parseErr
+			}
+		case OP_LS:
+			switch b {
+			case '+':
+				c.state = OP_SUB
+			case '-':
+				c.state = OP_UNSUB
+			default:
+				goto parseErr
+			}
+		case OP_R:
+			switch b {
+			case 'S', 's':
+				c.state = OP_RS
+			case 'M', 'm':
+				c.state = OP_M
+			default:
+				goto parseErr
+			}
+		case OP_RS:
+			switch b {
+			case '+':
+				c.state = OP_SUB
+			case '-':
+				c.state = OP_UNSUB
+			default:
+				goto parseErr
 			}
 		case OP_U:
 			switch b {
@@ -337,7 +748,39 @@ func (c *client) parse(buf []byte) error {
 				} else {
 					arg = buf[c.as : i-c.drop]
 				}
-				if err := c.processUnsub(arg); err != nil {
+				if err := c.overMaxControlLineLimit(arg, mcl); err != nil {
+					return err
+				}
+				var err error
+
+				switch c.kind {
+				case CLIENT:
+					if trace {
+						c.traceInOp("UNSUB", arg)
+					}
+					err = c.processUnsub(arg)
+				case ROUTER:
+					if trace && c.srv != nil {
+						switch c.op {
+						case 'R', 'r':
+							c.traceInOp("RS-", arg)
+						case 'L', 'l':
+							c.traceInOp("LS-", arg)
+						}
+					}
+					err = c.processRemoteUnsub(arg)
+				case GATEWAY:
+					if trace {
+						c.traceInOp("RS-", arg)
+					}
+					err = c.processGatewayRUnsub(arg)
+				case LEAF:
+					if trace {
+						c.traceInOp("LS-", arg)
+					}
+					err = c.processLeafUnsub(arg)
+				}
+				if err != nil {
 					return err
 				}
 				c.drop, c.as, c.state = 0, i+1, OP_START
@@ -363,6 +806,9 @@ func (c *client) parse(buf []byte) error {
 		case OP_PING:
 			switch b {
 			case '\n':
+				if trace {
+					c.traceInOp("PING", nil)
+				}
 				c.processPing()
 				c.drop, c.state = 0, OP_START
 			}
@@ -383,6 +829,9 @@ func (c *client) parse(buf []byte) error {
 		case OP_PONG:
 			switch b {
 			case '\n':
+				if trace {
+					c.traceInOp("PONG", nil)
+				}
 				c.processPong()
 				c.drop, c.state = 0, OP_START
 			}
@@ -448,12 +897,20 @@ func (c *client) parse(buf []byte) error {
 				} else {
 					arg = buf[c.as : i-c.drop]
 				}
+				if err := c.overMaxControlLineLimit(arg, mcl); err != nil {
+					return err
+				}
+				if trace {
+					c.traceInOp("CONNECT", removePassFromTrace(arg))
+				}
 				if err := c.processConnect(arg); err != nil {
 					return err
 				}
 				c.drop, c.state = 0, OP_START
 				// Reset notion on authSet
-				authSet = c.isAuthTimerSet()
+				c.mu.Lock()
+				authSet = c.awaitingAuth()
+				c.mu.Unlock()
 			default:
 				if c.argBuf != nil {
 					c.argBuf = append(c.argBuf, b)
@@ -485,6 +942,7 @@ func (c *client) parse(buf []byte) error {
 			case ' ', '\t':
 				continue
 			default:
+				c.pa.hdr = -1
 				c.state = MSG_ARG
 				c.as = i
 			}
@@ -496,10 +954,35 @@ func (c *client) parse(buf []byte) error {
 				var arg []byte
 				if c.argBuf != nil {
 					arg = c.argBuf
+					c.argBuf = nil
 				} else {
 					arg = buf[c.as : i-c.drop]
 				}
-				if err := c.processMsgArgs(arg); err != nil {
+				if err := c.overMaxControlLineLimit(arg, mcl); err != nil {
+					return err
+				}
+				var err error
+				if c.kind == ROUTER || c.kind == GATEWAY {
+					switch c.op {
+					case 'R', 'r':
+						if trace {
+							c.traceInOp("RMSG", arg)
+						}
+						err = c.processRoutedMsgArgs(arg)
+					case 'L', 'l':
+						if trace {
+							c.traceInOp("LMSG", arg)
+						}
+						lmsg = true
+						err = c.processRoutedOriginClusterMsgArgs(arg)
+					}
+				} else if c.kind == LEAF {
+					if trace {
+						c.traceInOp("LMSG", arg)
+					}
+					err = c.processLeafMsgArgs(arg)
+				}
+				if err != nil {
 					return err
 				}
 				c.drop, c.as, c.state = 0, i+1, MSG_PAYLOAD
@@ -507,7 +990,7 @@ func (c *client) parse(buf []byte) error {
 				// jump ahead with the index. If this overruns
 				// what is left we fall out and process split
 				// buffer.
-				i = c.as + c.pa.size - 1
+				i = c.as + c.pa.size - LEN_CR_LF
 			default:
 				if c.argBuf != nil {
 					c.argBuf = append(c.argBuf, b)
@@ -553,6 +1036,9 @@ func (c *client) parse(buf []byte) error {
 					c.argBuf = nil
 				} else {
 					arg = buf[c.as : i-c.drop]
+				}
+				if err := c.overMaxControlLineLimit(arg, mcl); err != nil {
+					return err
 				}
 				if err := c.processInfo(arg); err != nil {
 					return err
@@ -630,6 +1116,9 @@ func (c *client) parse(buf []byte) error {
 				} else {
 					arg = buf[c.as : i-c.drop]
 				}
+				if err := c.overMaxControlLineLimit(arg, mcl); err != nil {
+					return err
+				}
 				c.processErr(string(arg))
 				c.drop, c.as, c.state = 0, i+1, OP_START
 			default:
@@ -643,9 +1132,12 @@ func (c *client) parse(buf []byte) error {
 	}
 
 	// Check for split buffer scenarios for any ARG state.
-	if c.state == SUB_ARG || c.state == UNSUB_ARG || c.state == PUB_ARG ||
-		c.state == MSG_ARG || c.state == MINUS_ERR_ARG ||
-		c.state == CONNECT_ARG || c.state == INFO_ARG {
+	if c.state == SUB_ARG || c.state == UNSUB_ARG ||
+		c.state == PUB_ARG || c.state == HPUB_ARG ||
+		c.state == ASUB_ARG || c.state == AUSUB_ARG ||
+		c.state == MSG_ARG || c.state == HMSG_ARG ||
+		c.state == MINUS_ERR_ARG || c.state == CONNECT_ARG || c.state == INFO_ARG {
+
 		// Setup a holder buffer to deal with split buffer scenario.
 		if c.argBuf == nil {
 			c.argBuf = c.scratch[:0]
@@ -654,27 +1146,27 @@ func (c *client) parse(buf []byte) error {
 		// Check for violations of control line length here. Note that this is not
 		// exact at all but the performance hit is too great to be precise, and
 		// catching here should prevent memory exhaustion attacks.
-		if len(c.argBuf) > mcl {
-			c.sendErr("Maximum Control Line Exceeded")
-			c.closeConnection()
-			return ErrMaxControlLine
+		if err := c.overMaxControlLineLimit(c.argBuf, mcl); err != nil {
+			return err
 		}
 	}
 
 	// Check for split msg
-	if (c.state == MSG_PAYLOAD || c.state == MSG_END) && c.msgBuf == nil {
+	if (c.state == MSG_PAYLOAD || c.state == MSG_END_R || c.state == MSG_END_N) && c.msgBuf == nil {
 		// We need to clone the pubArg if it is still referencing the
 		// read buffer and we are not able to process the msg.
+
 		if c.argBuf == nil {
-			// Works also for MSG_ARG, when message comes from ROUTE.
-			c.clonePubArg()
+			// Works also for MSG_ARG, when message comes from ROUTE or GATEWAY.
+			if err := c.clonePubArg(lmsg); err != nil {
+				goto parseErr
+			}
 		}
 
 		// If we will overflow the scratch buffer, just create a
 		// new buffer to hold the split message.
 		if c.pa.size > cap(c.scratch)-len(c.argBuf) {
 			lrem := len(buf[c.as:])
-
 			// Consider it a protocol error when the remaining payload
 			// is larger than the reported size for PUB. It can happen
 			// when processing incomplete messages from rogue clients.
@@ -693,18 +1185,17 @@ func (c *client) parse(buf []byte) error {
 
 authErr:
 	c.authViolation()
-	return ErrAuthorization
+	return ErrAuthentication
 
 parseErr:
 	c.sendErr("Unknown Protocol Operation")
-	snip := protoSnippet(i, buf)
-	err := fmt.Errorf("%s Parser ERROR, state=%d, i=%d: proto='%s...'",
-		c.typeString(), c.state, i, snip)
+	snip := protoSnippet(i, PROTO_SNIPPET_SIZE, buf)
+	err := fmt.Errorf("%s parser ERROR, state=%d, i=%d: proto='%s...'", c.kindString(), c.state, i, snip)
 	return err
 }
 
-func protoSnippet(start int, buf []byte) string {
-	stop := start + PROTO_SNIPPET_SIZE
+func protoSnippet(start, max int, buf []byte) string {
+	stop := start + max
 	bufSize := len(buf)
 	if start >= bufSize {
 		return `""`
@@ -715,24 +1206,65 @@ func protoSnippet(start int, buf []byte) string {
 	return fmt.Sprintf("%q", buf[start:stop])
 }
 
+// Check if the length of buffer `arg` is over the max control line limit `mcl`.
+// If so, an error is sent to the client and the connection is closed.
+// The error ErrMaxControlLine is returned.
+func (c *client) overMaxControlLineLimit(arg []byte, mcl int32) error {
+	if c.kind != CLIENT {
+		return nil
+	}
+	if len(arg) > int(mcl) {
+		err := NewErrorCtx(ErrMaxControlLine, "State %d, max_control_line %d, Buffer len %d (snip: %s...)",
+			c.state, int(mcl), len(c.argBuf), protoSnippet(0, MAX_CONTROL_LINE_SNIPPET_SIZE, arg))
+		c.sendErr(err.Error())
+		c.closeConnection(MaxControlLineExceeded)
+		return err
+	}
+	return nil
+}
+
 // clonePubArg is used when the split buffer scenario has the pubArg in the existing read buffer, but
 // we need to hold onto it into the next read.
-func (c *client) clonePubArg() {
+func (c *client) clonePubArg(lmsg bool) error {
+	// Just copy and re-process original arg buffer.
 	c.argBuf = c.scratch[:0]
-	c.argBuf = append(c.argBuf, c.pa.subject...)
-	c.argBuf = append(c.argBuf, c.pa.reply...)
-	c.argBuf = append(c.argBuf, c.pa.sid...)
-	c.argBuf = append(c.argBuf, c.pa.szb...)
+	c.argBuf = append(c.argBuf, c.pa.arg...)
 
-	c.pa.subject = c.argBuf[:len(c.pa.subject)]
-
-	if c.pa.reply != nil {
-		c.pa.reply = c.argBuf[len(c.pa.subject) : len(c.pa.subject)+len(c.pa.reply)]
+	switch c.kind {
+	case ROUTER, GATEWAY:
+		if lmsg {
+			return c.processRoutedOriginClusterMsgArgs(c.argBuf)
+		}
+		if c.pa.hdr < 0 {
+			return c.processRoutedMsgArgs(c.argBuf)
+		} else {
+			return c.processRoutedHeaderMsgArgs(c.argBuf)
+		}
+	case LEAF:
+		if c.pa.hdr < 0 {
+			return c.processLeafMsgArgs(c.argBuf)
+		} else {
+			return c.processLeafHeaderMsgArgs(c.argBuf)
+		}
+	default:
+		if c.pa.hdr < 0 {
+			return c.processPub(c.argBuf)
+		} else {
+			return c.processHeaderPub(c.argBuf)
+		}
 	}
+}
 
-	if c.pa.sid != nil {
-		c.pa.sid = c.argBuf[len(c.pa.subject)+len(c.pa.reply) : len(c.pa.subject)+len(c.pa.reply)+len(c.pa.sid)]
+func (ps *parseState) getHeader() http.Header {
+	if ps.header == nil {
+		if hdr := ps.pa.hdr; hdr > 0 {
+			reader := bufio.NewReader(bytes.NewReader(ps.msgBuf[0:hdr]))
+			tp := textproto.NewReader(reader)
+			tp.ReadLine() // skip over first line, contains version
+			if mimeHeader, err := tp.ReadMIMEHeader(); err == nil {
+				ps.header = http.Header(mimeHeader)
+			}
+		}
 	}
-
-	c.pa.szb = c.argBuf[len(c.pa.subject)+len(c.pa.reply)+len(c.pa.sid):]
+	return ps.header
 }

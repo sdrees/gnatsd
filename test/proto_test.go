@@ -1,12 +1,24 @@
-// Copyright 2012-2014 Apcera Inc. All rights reserved.
+// Copyright 2012-2020 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package test
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
-	"github.com/nats-io/gnatsd/server"
+	"github.com/nats-io/nats-server/v2/server"
 )
 
 const PROTO_TEST_PORT = 9922
@@ -14,6 +26,8 @@ const PROTO_TEST_PORT = 9922
 func runProtoServer() *server.Server {
 	opts := DefaultTestOptions
 	opts.Port = PROTO_TEST_PORT
+	opts.MaxControlLine = 256
+	opts.NoSystemAccount = true
 	return RunServer(&opts)
 }
 
@@ -21,7 +35,7 @@ func TestProtoBasics(t *testing.T) {
 	s := runProtoServer()
 	defer s.Shutdown()
 
-	c := createClientConn(t, "localhost", PROTO_TEST_PORT)
+	c := createClientConn(t, "127.0.0.1", PROTO_TEST_PORT)
 	defer c.Close()
 
 	send, expect := setupConn(t, c)
@@ -48,7 +62,7 @@ func TestProtoErr(t *testing.T) {
 	s := runProtoServer()
 	defer s.Shutdown()
 
-	c := createClientConn(t, "localhost", PROTO_TEST_PORT)
+	c := createClientConn(t, "127.0.0.1", PROTO_TEST_PORT)
 	defer c.Close()
 
 	send, expect := setupConn(t, c)
@@ -62,7 +76,7 @@ func TestUnsubMax(t *testing.T) {
 	s := runProtoServer()
 	defer s.Shutdown()
 
-	c := createClientConn(t, "localhost", PROTO_TEST_PORT)
+	c := createClientConn(t, "127.0.0.1", PROTO_TEST_PORT)
 	defer c.Close()
 
 	send, expect := setupConn(t, c)
@@ -85,7 +99,7 @@ func TestQueueSub(t *testing.T) {
 	s := runProtoServer()
 	defer s.Shutdown()
 
-	c := createClientConn(t, "localhost", PROTO_TEST_PORT)
+	c := createClientConn(t, "127.0.0.1", PROTO_TEST_PORT)
 	defer c.Close()
 
 	send, expect := setupConn(t, c)
@@ -119,7 +133,7 @@ func TestMultipleQueueSub(t *testing.T) {
 	s := runProtoServer()
 	defer s.Shutdown()
 
-	c := createClientConn(t, "localhost", PROTO_TEST_PORT)
+	c := createClientConn(t, "127.0.0.1", PROTO_TEST_PORT)
 	defer c.Close()
 
 	send, expect := setupConn(t, c)
@@ -156,7 +170,7 @@ func TestPubToArgState(t *testing.T) {
 	s := runProtoServer()
 	defer s.Shutdown()
 
-	c := createClientConn(t, "localhost", PROTO_TEST_PORT)
+	c := createClientConn(t, "127.0.0.1", PROTO_TEST_PORT)
 	defer c.Close()
 
 	send, expect := setupConn(t, c)
@@ -169,7 +183,7 @@ func TestSubToArgState(t *testing.T) {
 	s := runProtoServer()
 	defer s.Shutdown()
 
-	c := createClientConn(t, "localhost", PROTO_TEST_PORT)
+	c := createClientConn(t, "127.0.0.1", PROTO_TEST_PORT)
 	defer c.Close()
 
 	send, expect := setupConn(t, c)
@@ -183,14 +197,14 @@ func TestProtoCrash(t *testing.T) {
 	s := runProtoServer()
 	defer s.Shutdown()
 
-	c := createClientConn(t, "localhost", PROTO_TEST_PORT)
+	c := createClientConn(t, "127.0.0.1", PROTO_TEST_PORT)
 	defer c.Close()
 
 	send, expect := sendCommand(t, c), expectCommand(t, c)
 
 	checkInfoMsg(t, c)
 
-	send("CONNECT {\"verbose\":true,\"ssl_required\":false,\"user\":\"test\",\"pedantic\":true,\"pass\":\"password\"}")
+	send("CONNECT {\"verbose\":true,\"tls_required\":false,\"user\":\"test\",\"pedantic\":true,\"pass\":\"password\"}")
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -203,7 +217,7 @@ func TestDuplicateProtoSub(t *testing.T) {
 	s := runProtoServer()
 	defer s.Shutdown()
 
-	c := createClientConn(t, "localhost", PROTO_TEST_PORT)
+	c := createClientConn(t, "127.0.0.1", PROTO_TEST_PORT)
 	defer c.Close()
 
 	send, expect := setupConn(t, c)
@@ -235,7 +249,7 @@ func TestIncompletePubArg(t *testing.T) {
 	s := runProtoServer()
 	defer s.Shutdown()
 
-	c := createClientConn(t, "localhost", PROTO_TEST_PORT)
+	c := createClientConn(t, "127.0.0.1", PROTO_TEST_PORT)
 	defer c.Close()
 	send, expect := setupConn(t, c)
 
@@ -269,7 +283,7 @@ func TestControlLineMaximums(t *testing.T) {
 	s := runProtoServer()
 	defer s.Shutdown()
 
-	c := createClientConn(t, "localhost", PROTO_TEST_PORT)
+	c := createClientConn(t, "127.0.0.1", PROTO_TEST_PORT)
 	defer c.Close()
 
 	send, expect := setupConn(t, c)
@@ -280,4 +294,26 @@ func TestControlLineMaximums(t *testing.T) {
 	}
 	send(pubTooLong)
 	expect(errRe)
+}
+
+func TestServerInfoWithClientAdvertise(t *testing.T) {
+	opts := DefaultTestOptions
+	opts.Port = PROTO_TEST_PORT
+	opts.ClientAdvertise = "me:1"
+	s := RunServer(&opts)
+	defer s.Shutdown()
+
+	c := createClientConn(t, opts.Host, PROTO_TEST_PORT)
+	defer c.Close()
+
+	buf := expectResult(t, c, infoRe)
+	js := infoRe.FindAllSubmatch(buf, 1)[0][1]
+	var sinfo server.Info
+	err := json.Unmarshal(js, &sinfo)
+	if err != nil {
+		t.Fatalf("Could not unmarshal INFO json: %v\n", err)
+	}
+	if sinfo.Host != "me" || sinfo.Port != 1 {
+		t.Fatalf("Expected INFO Host:Port to be me:1, got %s:%d", sinfo.Host, sinfo.Port)
+	}
 }

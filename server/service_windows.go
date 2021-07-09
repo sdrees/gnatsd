@@ -1,4 +1,15 @@
-// Copyright 2012-2017 Apcera Inc. All rights reserved.
+// Copyright 2012-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package server
 
@@ -7,18 +18,25 @@ import (
 	"time"
 
 	"golang.org/x/sys/windows/svc"
-	"golang.org/x/sys/windows/svc/debug"
 )
 
 const (
-	serviceName     = "gnatsd"
 	reopenLogCode   = 128
 	reopenLogCmd    = svc.Cmd(reopenLogCode)
+	ldmCode         = 129
+	ldmCmd          = svc.Cmd(ldmCode)
 	acceptReopenLog = svc.Accepted(reopenLogCode)
 )
 
+var serviceName = "nats-server"
+
+// SetServiceName allows setting a different service name
+func SetServiceName(name string) {
+	serviceName = name
+}
+
 // winServiceWrapper implements the svc.Handler interface for implementing
-// gnatsd as a Windows service.
+// nats-server as a Windows service.
 type winServiceWrapper struct {
 	server *Server
 }
@@ -70,6 +88,8 @@ loop:
 		case reopenLogCmd:
 			// File log re-open for rotating file logs.
 			w.server.ReOpenLogFile()
+		case ldmCmd:
+			go w.server.lameDuckMode()
 		case svc.ParamChange:
 			if err := w.server.Reload(); err != nil {
 				w.server.Errorf("Failed to reload server configuration: %s", err)
@@ -89,15 +109,15 @@ func Run(server *Server) error {
 		server.Start()
 		return nil
 	}
-	run := svc.Run
 	isInteractive, err := svc.IsAnInteractiveSession()
 	if err != nil {
 		return err
 	}
 	if isInteractive {
-		run = debug.Run
+		server.Start()
+		return nil
 	}
-	return run(serviceName, &winServiceWrapper{server})
+	return svc.Run(serviceName, &winServiceWrapper{server})
 }
 
 // isWindowsService indicates if NATS is running as a Windows service.

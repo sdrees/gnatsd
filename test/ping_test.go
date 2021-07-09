@@ -1,4 +1,15 @@
-// Copyright 2012-2017 Apcera Inc. All rights reserved.
+// Copyright 2012-2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package test
 
@@ -9,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/gnatsd/server"
+	"github.com/nats-io/nats-server/v2/server"
 )
 
 const (
@@ -45,7 +56,7 @@ func TestPingSentToTLSConnection(t *testing.T) {
 	s := RunServer(&opts)
 	defer s.Shutdown()
 
-	c := createClientConn(t, "localhost", PING_TEST_PORT)
+	c := createClientConn(t, "127.0.0.1", PING_TEST_PORT)
 	defer c.Close()
 
 	checkInfoMsg(t, c)
@@ -53,7 +64,7 @@ func TestPingSentToTLSConnection(t *testing.T) {
 	tlsConn := c.(*tls.Conn)
 	tlsConn.Handshake()
 
-	cs := fmt.Sprintf("CONNECT {\"verbose\":%v,\"pedantic\":%v,\"ssl_required\":%v}\r\n", false, false, true)
+	cs := fmt.Sprintf("CONNECT {\"verbose\":%v,\"pedantic\":%v,\"tls_required\":%v}\r\n", false, false, true)
 	sendProto(t, c, cs)
 
 	expect := expectCommand(t, c)
@@ -93,7 +104,7 @@ func TestPingInterval(t *testing.T) {
 	s := runPingServer()
 	defer s.Shutdown()
 
-	c := createClientConn(t, "localhost", PING_TEST_PORT)
+	c := createClientConn(t, "127.0.0.1", PING_TEST_PORT)
 	defer c.Close()
 
 	doConnect(t, c, false, false, false)
@@ -135,7 +146,7 @@ func TestUnpromptedPong(t *testing.T) {
 	s := runPingServer()
 	defer s.Shutdown()
 
-	c := createClientConn(t, "localhost", PING_TEST_PORT)
+	c := createClientConn(t, "127.0.0.1", PING_TEST_PORT)
 	defer c.Close()
 
 	doConnect(t, c, false, false, false)
@@ -175,4 +186,45 @@ func TestUnpromptedPong(t *testing.T) {
 	if ne, ok := err.(net.Error); ok && ne.Timeout() {
 		t.Fatal("timeout: Expected to have connection closed")
 	}
+}
+
+func TestPingSuppresion(t *testing.T) {
+	pingInterval := 100 * time.Millisecond
+	highWater := 130 * time.Millisecond
+	opts := DefaultTestOptions
+	opts.Port = PING_TEST_PORT
+	opts.PingInterval = pingInterval
+
+	s := RunServer(&opts)
+	defer s.Shutdown()
+
+	c := createClientConn(t, "127.0.0.1", PING_TEST_PORT)
+	defer c.Close()
+
+	connectTime := time.Now()
+
+	send, expect := setupConn(t, c)
+
+	expect(pingRe)
+	pingTime := time.Since(connectTime)
+	send("PONG\r\n")
+
+	// Should be > 100 but less then 120(ish)
+	if pingTime < pingInterval {
+		t.Fatalf("pingTime too low: %v", pingTime)
+	}
+	// +5 is just for fudging in case things are slow in the testing system.
+	if pingTime > highWater {
+		t.Fatalf("pingTime too high: %v", pingTime)
+	}
+
+	time.Sleep(pingInterval / 2)
+
+	// Sending a PING should suppress.
+	send("PING\r\n")
+	expect(pongRe)
+
+	// This will wait for the time period where a PING should have fired
+	// and been delivered. We expect nothing here since it should be suppressed.
+	expectNothingTimeout(t, c, time.Now().Add(100*time.Millisecond))
 }

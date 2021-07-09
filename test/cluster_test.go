@@ -1,47 +1,59 @@
-// Copyright 2013-2016 Apcera Inc. All rights reserved.
+// Copyright 2013-2020 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package test
 
 import (
 	"errors"
 	"fmt"
+	"math/rand"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/nats-io/gnatsd/server"
+	"github.com/nats-io/nats-server/v2/server"
 )
 
 // Helper function to check that a cluster is formed
 func checkClusterFormed(t *testing.T, servers ...*server.Server) {
-	// Wait for the cluster to form
-	var err string
+	t.Helper()
 	expectedNumRoutes := len(servers) - 1
-	maxTime := time.Now().Add(5 * time.Second)
-	for time.Now().Before(maxTime) {
-		err = ""
+	checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
 		for _, s := range servers {
 			if numRoutes := s.NumRoutes(); numRoutes != expectedNumRoutes {
-				err = fmt.Sprintf("Expected %d routes for server %q, got %d", expectedNumRoutes, s.ID(), numRoutes)
-				break
+				return fmt.Errorf("Expected %d routes for server %q, got %d", expectedNumRoutes, s.ID(), numRoutes)
 			}
 		}
-		if err != "" {
-			time.Sleep(100 * time.Millisecond)
-		} else {
-			break
+		return nil
+	})
+}
+
+func checkNumRoutes(t *testing.T, s *server.Server, expected int) {
+	t.Helper()
+	checkFor(t, 5*time.Second, 15*time.Millisecond, func() error {
+		if nr := s.NumRoutes(); nr != expected {
+			return fmt.Errorf("Expected %v routes, got %v", expected, nr)
 		}
-	}
-	if err != "" {
-		t.Fatalf("%s", err)
-	}
+		return nil
+	})
 }
 
 // Helper function to check that a server (or list of servers) have the
-// expected number of subscriptions
+// expected number of subscriptions.
 func checkExpectedSubs(expected int, servers ...*server.Server) error {
 	var err string
-	maxTime := time.Now().Add(5 * time.Second)
+	maxTime := time.Now().Add(10 * time.Second)
 	for time.Now().Before(maxTime) {
 		err = ""
 		for _, s := range servers {
@@ -51,7 +63,7 @@ func checkExpectedSubs(expected int, servers ...*server.Server) error {
 			}
 		}
 		if err != "" {
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 		} else {
 			break
 		}
@@ -60,6 +72,45 @@ func checkExpectedSubs(expected int, servers ...*server.Server) error {
 		return errors.New(err)
 	}
 	return nil
+}
+
+func checkSubInterest(t *testing.T, s *server.Server, accName, subject string, timeout time.Duration) {
+	t.Helper()
+	checkFor(t, timeout, 15*time.Millisecond, func() error {
+		acc, err := s.LookupAccount(accName)
+		if err != nil {
+			return fmt.Errorf("error looking up account %q: %v", accName, err)
+		}
+		if acc.SubscriptionInterest(subject) {
+			return nil
+		}
+		return fmt.Errorf("no subscription interest for account %q on %q", accName, subject)
+	})
+}
+
+func checkNoSubInterest(t *testing.T, s *server.Server, accName, subject string, timeout time.Duration) {
+	t.Helper()
+	acc, err := s.LookupAccount(accName)
+	if err != nil {
+		t.Fatalf("error looking up account %q: %v", accName, err)
+	}
+
+	start := time.Now()
+	for time.Now().Before(start.Add(timeout)) {
+		if acc.SubscriptionInterest(subject) {
+			t.Fatalf("Did not expect interest for %q", subject)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func runThreeServers(t *testing.T) (srvA, srvB, srvC *server.Server, optsA, optsB, optsC *server.Options) {
+	srvA, optsA = RunServerWithConfig("./configs/srv_a.conf")
+	srvB, optsB = RunServerWithConfig("./configs/srv_b.conf")
+	srvC, optsC = RunServerWithConfig("./configs/srv_c.conf")
+
+	checkClusterFormed(t, srvA, srvB, srvC)
+	return
 }
 
 func runServers(t *testing.T) (srvA, srvB *server.Server, optsA, optsB *server.Options) {
@@ -151,7 +202,8 @@ func TestClusterQueueSubs(t *testing.T) {
 	expectA(pongRe)
 
 	// Make sure the subs have propagated to srvB before continuing
-	if err := checkExpectedSubs(len(qg1SidsA), srvB); err != nil {
+	// New cluster proto this will only be 1.
+	if err := checkExpectedSubs(1, srvB); err != nil {
 		t.Fatalf("%v", err)
 	}
 
@@ -178,7 +230,8 @@ func TestClusterQueueSubs(t *testing.T) {
 	expectA(pongRe)
 
 	// Make sure the subs have propagated to srvB before continuing
-	if err := checkExpectedSubs(len(qg1SidsA)+len(pSids), srvB); err != nil {
+	// Normal foo and the queue group will be one a piece, so 2 + wc == 3
+	if err := checkExpectedSubs(3, srvB); err != nil {
 		t.Fatalf("%v", err)
 	}
 
@@ -209,7 +262,8 @@ func TestClusterQueueSubs(t *testing.T) {
 	expectB(pongRe)
 
 	// Make sure the subs have propagated to srvA before continuing
-	if err := checkExpectedSubs(len(qg1SidsA)+len(pSids)+len(qg2SidsB), srvA); err != nil {
+	// This will be all the subs on A and just 1 from B that gets coalesced.
+	if err := checkExpectedSubs(len(qg1SidsA)+len(pSids)+1, srvA); err != nil {
 		t.Fatalf("%v", err)
 	}
 
@@ -233,7 +287,7 @@ func TestClusterQueueSubs(t *testing.T) {
 	expectA(pongRe)
 
 	// Make sure the subs have propagated to srvB before continuing
-	if err := checkExpectedSubs(len(pSids)+len(qg2SidsB), srvB); err != nil {
+	if err := checkExpectedSubs(1+1+len(qg2SidsB), srvB); err != nil {
 		t.Fatalf("%v", err)
 	}
 
@@ -292,7 +346,7 @@ func TestClusterDoubleMsgs(t *testing.T) {
 	expectA1(pongRe)
 
 	// Make sure the subs have propagated to srvB before continuing
-	if err := checkExpectedSubs(len(qg1SidsA), srvB); err != nil {
+	if err := checkExpectedSubs(1, srvB); err != nil {
 		t.Fatalf("%v", err)
 	}
 
@@ -313,7 +367,7 @@ func TestClusterDoubleMsgs(t *testing.T) {
 	pSids := []string{"1", "2"}
 
 	// Make sure the subs have propagated to srvB before continuing
-	if err := checkExpectedSubs(len(qg1SidsA)+2, srvB); err != nil {
+	if err := checkExpectedSubs(1+2, srvB); err != nil {
 		t.Fatalf("%v", err)
 	}
 
@@ -437,6 +491,8 @@ func TestAutoUnsubscribePropagation(t *testing.T) {
 	sendA("PING\r\n")
 	expectA(pongRe)
 
+	time.Sleep(50 * time.Millisecond)
+
 	// Make sure number of subscriptions on B is correct
 	if subs := srvB.NumSubscriptions(); subs != 0 {
 		t.Fatalf("Expected no subscriptions on remote server, got %d\n", subs)
@@ -475,5 +531,142 @@ func TestAutoUnsubscribePropagationOnClientDisconnect(t *testing.T) {
 	// No subs should be on the cluster when all clients is disconnected
 	if err := checkExpectedSubs(0, cluster...); err != nil {
 		t.Fatalf("%v", err)
+	}
+}
+
+func TestClusterNameOption(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		cluster {
+			name: MyCluster
+			listen: 127.0.0.1:-1
+		}
+	`))
+	defer removeFile(t, conf)
+
+	s, opts := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	c := createClientConn(t, opts.Host, opts.Port)
+	defer c.Close()
+
+	si := checkInfoMsg(t, c)
+	if si.Cluster != "MyCluster" {
+		t.Fatalf("Expected a cluster name of %q, got %q", "MyCluster", si.Cluster)
+	}
+}
+
+func TestEphemeralClusterName(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		cluster {
+			listen: 127.0.0.1:-1
+		}
+	`))
+	defer removeFile(t, conf)
+
+	s, opts := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	c := createClientConn(t, opts.Host, opts.Port)
+	defer c.Close()
+
+	si := checkInfoMsg(t, c)
+	if si.Cluster == "" {
+		t.Fatalf("Expected an ephemeral cluster name to be set")
+	}
+}
+
+type captureErrLogger struct {
+	dummyLogger
+	ch chan string
+}
+
+func (c *captureErrLogger) Errorf(format string, v ...interface{}) {
+	msg := fmt.Sprintf(format, v...)
+	select {
+	case c.ch <- msg:
+	default:
+	}
+}
+
+func TestClusterNameConflictsDropRoutes(t *testing.T) {
+	ll := &captureErrLogger{ch: make(chan string, 4)}
+
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		cluster {
+			name: MyCluster33
+			listen: 127.0.0.1:5244
+		}
+	`))
+	defer removeFile(t, conf)
+
+	s1, _ := RunServerWithConfig(conf)
+	defer s1.Shutdown()
+	s1.SetLogger(ll, false, false)
+
+	conf2 := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		cluster {
+			name: MyCluster22
+			listen: 127.0.0.1:-1
+			routes = [nats-route://127.0.0.1:5244]
+		}
+	`))
+	defer removeFile(t, conf2)
+
+	s2, _ := RunServerWithConfig(conf2)
+	defer s2.Shutdown()
+	s2.SetLogger(ll, false, false)
+
+	select {
+	case msg := <-ll.ch:
+		if !strings.Contains(msg, "Rejecting connection") || !strings.Contains(msg, "does not match") {
+			t.Fatalf("Got bad error about cluster name mismatch")
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("Expected an error, timed out")
+	}
+}
+
+func TestClusterNameDynamicNegotiation(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		cluster {listen: 127.0.0.1:5244}
+	`))
+	defer removeFile(t, conf)
+
+	seed, _ := RunServerWithConfig(conf)
+	defer seed.Shutdown()
+
+	oconf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		cluster {
+			listen: 127.0.0.1:-1
+			routes = [nats-route://127.0.0.1:5244]
+		}
+	`))
+	defer removeFile(t, oconf)
+
+	// Create a random number of additional servers, up to 20.
+	numServers := rand.Intn(20) + 1
+	servers := make([]*server.Server, 0, numServers+1)
+	servers = append(servers, seed)
+
+	for i := 0; i < numServers; i++ {
+		s, _ := RunServerWithConfig(oconf)
+		defer s.Shutdown()
+		servers = append(servers, s)
+	}
+
+	// If this passes we should have all the same name.
+	checkClusterFormed(t, servers...)
+
+	clusterName := seed.ClusterName()
+	for _, s := range servers {
+		if s.ClusterName() != clusterName {
+			t.Fatalf("Expected the cluster names to all be the same as %q, got %q", clusterName, s.ClusterName())
+		}
 	}
 }

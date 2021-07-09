@@ -1,4 +1,15 @@
-// Copyright 2012-2015 Apcera Inc. All rights reserved.
+// Copyright 2012-2020 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package test
 
@@ -16,8 +27,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/gnatsd/server"
-	"github.com/nats-io/go-nats"
+	"github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
 )
 
 const CLIENT_PORT = 11422
@@ -28,8 +39,8 @@ func runMonitorServer() *server.Server {
 	opts := DefaultTestOptions
 	opts.Port = CLIENT_PORT
 	opts.HTTPPort = MONITOR_PORT
-	opts.HTTPHost = "localhost"
-
+	opts.HTTPHost = "127.0.0.1"
+	opts.NoSystemAccount = true
 	return RunServer(&opts)
 }
 
@@ -39,20 +50,20 @@ func runMonitorServerClusteredPair(t *testing.T) (*server.Server, *server.Server
 	opts := DefaultTestOptions
 	opts.Port = CLIENT_PORT
 	opts.HTTPPort = MONITOR_PORT
-	opts.HTTPHost = "localhost"
-	opts.Cluster.Host = "127.0.0.1"
-	opts.Cluster.Port = 10223
+	opts.HTTPHost = "127.0.0.1"
+	opts.Cluster = server.ClusterOpts{Name: "M", Host: "127.0.0.1", Port: 10223}
 	opts.Routes = server.RoutesFromStr("nats-route://127.0.0.1:10222")
+	opts.NoSystemAccount = true
 
 	s1 := RunServer(&opts)
 
 	opts2 := DefaultTestOptions
 	opts2.Port = CLIENT_PORT + 1
 	opts2.HTTPPort = MONITOR_PORT + 1
-	opts2.HTTPHost = "localhost"
-	opts2.Cluster.Host = "127.0.0.1"
-	opts2.Cluster.Port = 10222
+	opts2.HTTPHost = "127.0.0.1"
+	opts2.Cluster = server.ClusterOpts{Name: "M", Host: "127.0.0.1", Port: 10222}
 	opts2.Routes = server.RoutesFromStr("nats-route://127.0.0.1:10223")
+	opts2.NoSystemAccount = true
 
 	s2 := RunServer(&opts2)
 
@@ -66,12 +77,13 @@ func runMonitorServerNoHTTPPort() *server.Server {
 	opts := DefaultTestOptions
 	opts.Port = CLIENT_PORT
 	opts.HTTPPort = 0
+	opts.NoSystemAccount = true
 
 	return RunServer(&opts)
 }
 
 func resetPreviousHTTPConnections() {
-	http.DefaultTransport = &http.Transport{}
+	http.DefaultTransport.(*http.Transport).CloseIdleConnections()
 }
 
 // Make sure that we do not run the http server for monitoring unless asked.
@@ -79,7 +91,7 @@ func TestNoMonitorPort(t *testing.T) {
 	s := runMonitorServerNoHTTPPort()
 	defer s.Shutdown()
 
-	url := fmt.Sprintf("http://localhost:%d/", MONITOR_PORT)
+	url := fmt.Sprintf("http://127.0.0.1:%d/", MONITOR_PORT)
 	if resp, err := http.Get(url + "varz"); err == nil {
 		t.Fatalf("Expected error: Got %+v\n", resp)
 	}
@@ -93,12 +105,12 @@ func TestNoMonitorPort(t *testing.T) {
 
 // testEndpointDataRace tests a monitoring endpoint for data races by polling
 // while client code acts to ensure statistics are updated. It is designed to
-// run under the -race flag to catch  violations. The caller must start the
+// run under the -race flag to catch violations. The caller must start the
 // NATS server.
 func testEndpointDataRace(endpoint string, t *testing.T) {
 	var doneWg sync.WaitGroup
 
-	url := fmt.Sprintf("http://localhost:%d/", MONITOR_PORT)
+	url := fmt.Sprintf("http://127.0.0.1:%d/", MONITOR_PORT)
 
 	// Poll as fast as we can, while creating connections, publishing,
 	// and subscribing.
@@ -157,7 +169,7 @@ func TestVarz(t *testing.T) {
 	s := runMonitorServer()
 	defer s.Shutdown()
 
-	url := fmt.Sprintf("http://localhost:%d/", MONITOR_PORT)
+	url := fmt.Sprintf("http://127.0.0.1:%d/", MONITOR_PORT)
 	resp, err := http.Get(url + "varz")
 	if err != nil {
 		t.Fatalf("Expected no error: Got %v\n", err)
@@ -197,6 +209,10 @@ func TestVarz(t *testing.T) {
 		t.Fatalf("Got an error reading the body: %v\n", err)
 	}
 
+	if strings.Contains(string(body), "cluster_port") {
+		t.Fatal("Varz body contains cluster information when no cluster is defined.")
+	}
+
 	v = server.Varz{}
 	if err := json.Unmarshal(body, &v); err != nil {
 		t.Fatalf("Got an error unmarshalling the body: %v\n", err)
@@ -217,13 +233,21 @@ func TestVarz(t *testing.T) {
 	if v.OutBytes != 5 {
 		t.Fatalf("Expected OutBytes of 5, got %v\n", v.OutBytes)
 	}
+	if v.MaxPending != server.MAX_PENDING_SIZE {
+		t.Fatalf("Expected MaxPending of %d, got %v\n",
+			server.MAX_PENDING_SIZE, v.MaxPending)
+	}
+	if v.WriteDeadline != server.DEFAULT_FLUSH_DEADLINE {
+		t.Fatalf("Expected WriteDeadline of %d, got %v\n",
+			server.DEFAULT_FLUSH_DEADLINE, v.WriteDeadline)
+	}
 }
 
 func TestConnz(t *testing.T) {
 	s := runMonitorServer()
 	defer s.Shutdown()
 
-	url := fmt.Sprintf("http://localhost:%d/", MONITOR_PORT)
+	url := fmt.Sprintf("http://127.0.0.1:%d/", MONITOR_PORT)
 	resp, err := http.Get(url + "connz")
 	if err != nil {
 		t.Fatalf("Expected no error: Got %v\n", err)
@@ -344,7 +368,7 @@ func TestTLSConnz(t *testing.T) {
 	// Wait for message
 	<-ch
 
-	url := fmt.Sprintf("https://localhost:%d/", opts.HTTPSPort)
+	url := fmt.Sprintf("https://127.0.0.1:%d/", opts.HTTPSPort)
 	tlsConfig := &tls.Config{}
 	caCert, err := ioutil.ReadFile(rootCAFile)
 	if err != nil {
@@ -444,7 +468,7 @@ func TestConnzWithSubs(t *testing.T) {
 	cl := createClientConnSubscribeAndPublish(t)
 	defer cl.Close()
 
-	url := fmt.Sprintf("http://localhost:%d/", MONITOR_PORT)
+	url := fmt.Sprintf("http://127.0.0.1:%d/", MONITOR_PORT)
 	resp, err := http.Get(url + "connz?subs=1")
 	if err != nil {
 		t.Fatalf("Expected no error: Got %v\n", err)
@@ -489,7 +513,7 @@ func TestConnzWithAuth(t *testing.T) {
 	// Wait for message
 	<-ch
 
-	url := fmt.Sprintf("http://localhost:%d/", opts.HTTPPort)
+	url := fmt.Sprintf("http://127.0.0.1:%d/", opts.HTTPPort)
 
 	resp, err := http.Get(url + "connz?auth=1")
 	if err != nil {
@@ -515,7 +539,148 @@ func TestConnzWithAuth(t *testing.T) {
 		t.Fatalf("Expected authorized_user to be %q, got %q\n",
 			opts.Users[0].Username, ci.AuthorizedUser)
 	}
+}
 
+func TestConnzWithAccounts(t *testing.T) {
+	resetPreviousHTTPConnections()
+	s, opts := RunServerWithConfig("./configs/multi_accounts.conf")
+	defer s.Shutdown()
+
+	endpoint := fmt.Sprintf("%s:%d", opts.Host, opts.Port)
+
+	// Connect all the users. Tests depend on knowing users, accounts.
+	if len(opts.Users) != 6 {
+		t.Fatalf("Expected 6 total users, got %d", len(opts.Users))
+	}
+	if len(opts.Accounts) != 3 {
+		t.Fatalf("Expected 3 total accounts, got %d", len(opts.Accounts))
+	}
+
+	// Map from user to account name.
+	utoa := make(map[string]string)
+	conns := make([]*nats.Conn, len(opts.Users))
+	for _, u := range opts.Users {
+		nc, err := nats.Connect(fmt.Sprintf("nats://%s:%s@%s/", u.Username, u.Password, endpoint))
+		if err != nil {
+			t.Fatalf("Got an error on Connect: %+v\n", err)
+		}
+		defer nc.Close()
+		utoa[u.Username] = u.Account.Name
+		conns = append(conns, nc)
+	}
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/", opts.HTTPPort)
+
+	grabConnz := func(args string) *server.Connz {
+		t.Helper()
+		if args != "" {
+			args = "&" + args
+		}
+		resp, err := http.Get(url + "connz?auth=1" + args)
+		if err != nil {
+			t.Fatalf("Expected no error: Got %v\n", err)
+		}
+		if resp.StatusCode != 200 {
+			t.Fatalf("Expected a 200 response, got %d\n", resp.StatusCode)
+		}
+		defer resp.Body.Close()
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("Got an error reading the body: %v\n", err)
+		}
+		c := server.Connz{}
+		if err := json.Unmarshal(body, &c); err != nil {
+			t.Fatalf("Got an error unmarshalling the body: %v\n", err)
+		}
+		return &c
+	}
+
+	c := grabConnz("")
+	if c.NumConns != 6 {
+		t.Fatalf("Expected 6 connection entries, got %d", c.NumConns)
+	}
+
+	checkConn := func(ci *server.ConnInfo) {
+		t.Helper()
+		user := ci.AuthorizedUser
+		account := utoa[user]
+		if user == "" || account == "" {
+			t.Fatalf("Empty user or account: %q - %q", user, account)
+		}
+		if ci.Account != account {
+			t.Fatalf("Expected account of %q, got %q", account, ci.Account)
+		}
+	}
+
+	for i, ci := range c.Conns {
+		if ci.Cid != uint64(i+1) {
+			t.Fatalf("Expected CID of %d, got %d", i+1, ci.Cid)
+		}
+		checkConn(ci)
+	}
+
+	// Now make sure we can pull connections by account and user
+	pullByAccount := func(accName, state string) {
+		t.Helper()
+		c = grabConnz("acc=" + accName + "&state=" + state)
+		if c.NumConns != 2 {
+			t.Fatalf("Expected 2 connection entries, got %d", c.NumConns)
+		}
+		for _, ci := range c.Conns {
+			if ci.Account != accName {
+				t.Fatalf("Expected %q account, go %q", accName, ci.Account)
+			}
+		}
+	}
+
+	pullByUser := func(user, state string) {
+		t.Helper()
+		c = grabConnz("user=" + user + "&state=" + state)
+		if c.NumConns != 1 {
+			t.Fatalf("Expected 1 connection, got %d", c.NumConns)
+		}
+		if c.Conns[0].AuthorizedUser != user {
+			t.Fatalf("Expected user %q, got %q", user, c.Conns[0].AuthorizedUser)
+		}
+	}
+
+	pullByAccount("engineering", "open")
+	pullByAccount("finance", "open")
+	pullByAccount("legal", "open")
+
+	pullByUser("alice", "open")
+	pullByUser("bob", "open")
+
+	pullByUser("john", "open")
+	pullByUser("mary", "open")
+
+	pullByUser("peter", "open")
+	pullByUser("paul", "open")
+
+	// Now closed and make sure these work on closed as well.
+	for _, nc := range conns {
+		nc.Close()
+	}
+
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		if numClients := s.NumClients(); numClients != 0 {
+			return fmt.Errorf("Number of client is %d", numClients)
+		}
+		return nil
+	})
+
+	pullByAccount("engineering", "closed")
+	pullByAccount("finance", "closed")
+	pullByAccount("legal", "closed")
+
+	pullByUser("alice", "closed")
+	pullByUser("bob", "closed")
+
+	pullByUser("john", "closed")
+	pullByUser("mary", "closed")
+
+	pullByUser("peter", "closed")
+	pullByUser("paul", "closed")
 }
 
 func TestConnzWithOffsetAndLimit(t *testing.T) {
@@ -528,7 +693,7 @@ func TestConnzWithOffsetAndLimit(t *testing.T) {
 	cl2 := createClientConnSubscribeAndPublish(t)
 	defer cl2.Close()
 
-	url := fmt.Sprintf("http://localhost:%d/", MONITOR_PORT)
+	url := fmt.Sprintf("http://127.0.0.1:%d/", MONITOR_PORT)
 	resp, err := http.Get(url + "connz?offset=1&limit=1")
 	if err != nil {
 		t.Fatalf("Expected no error: Got %v\n", err)
@@ -567,7 +732,7 @@ func TestSubsz(t *testing.T) {
 	cl := createClientConnSubscribeAndPublish(t)
 	defer cl.Close()
 
-	url := fmt.Sprintf("http://localhost:%d/", MONITOR_PORT)
+	url := fmt.Sprintf("http://127.0.0.1:%d/", MONITOR_PORT)
 	resp, err := http.Get(url + "subscriptionsz")
 	if err != nil {
 		t.Fatalf("Expected no error: Got %v\n", err)
@@ -596,7 +761,7 @@ func TestHTTPHost(t *testing.T) {
 	s := runMonitorServer()
 	defer s.Shutdown()
 
-	// Grab non-localhost address and try to use that to connect.
+	// Grab non-127.0.0.1 address and try to use that to connect.
 	// Should fail.
 	var ip net.IP
 	ifaces, _ := net.Interfaces()
@@ -609,7 +774,7 @@ func TestHTTPHost(t *testing.T) {
 			case *net.IPAddr:
 				ip = v.IP
 			}
-			// Skip loopback/localhost or any ipv6 for now.
+			// Skip loopback/127.0.0.1 or any ipv6 for now.
 			if ip.IsLoopback() || ip.To4() == nil {
 				ip = nil
 				continue
@@ -631,9 +796,7 @@ func TestHTTPHost(t *testing.T) {
 
 // Create a connection to test ConnInfo
 func createClientConnSubscribeAndPublish(t *testing.T) net.Conn {
-	cl := createClientConn(t, "localhost", CLIENT_PORT)
-
-	sendCommand(t, cl)
+	cl := createClientConn(t, "127.0.0.1", CLIENT_PORT)
 	send, expect := setupConn(t, cl)
 	expectMsgs := expectMsgsCommand(t, expect)
 
@@ -646,7 +809,7 @@ func createClientConnSubscribeAndPublish(t *testing.T) net.Conn {
 func TestMonitorNoTLSConfig(t *testing.T) {
 	opts := DefaultTestOptions
 	opts.Port = CLIENT_PORT
-	opts.HTTPHost = "localhost"
+	opts.HTTPHost = "127.0.0.1"
 	opts.HTTPSPort = MONITOR_PORT
 	s := server.New(&opts)
 	defer s.Shutdown()
@@ -670,7 +833,7 @@ func TestMonitorErrorOnListen(t *testing.T) {
 
 	opts := DefaultTestOptions
 	opts.Port = CLIENT_PORT + 1
-	opts.HTTPHost = "localhost"
+	opts.HTTPHost = "127.0.0.1"
 	opts.HTTPPort = MONITOR_PORT
 	s2 := server.New(&opts)
 	defer s2.Shutdown()
@@ -682,7 +845,7 @@ func TestMonitorErrorOnListen(t *testing.T) {
 func TestMonitorBothPortsConfigured(t *testing.T) {
 	opts := DefaultTestOptions
 	opts.Port = CLIENT_PORT
-	opts.HTTPHost = "localhost"
+	opts.HTTPHost = "127.0.0.1"
 	opts.HTTPPort = MONITOR_PORT
 	opts.HTTPSPort = MONITOR_PORT + 1
 	s := server.New(&opts)
@@ -696,7 +859,7 @@ func TestMonitorStop(t *testing.T) {
 	resetPreviousHTTPConnections()
 	opts := DefaultTestOptions
 	opts.Port = CLIENT_PORT
-	opts.HTTPHost = "localhost"
+	opts.HTTPHost = "127.0.0.1"
 	opts.HTTPPort = MONITOR_PORT
 	url := fmt.Sprintf("http://%v:%d/", opts.HTTPHost, MONITOR_PORT)
 	// Create a server instance and start only the monitoring http server.
